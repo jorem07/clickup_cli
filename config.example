@@ -1,0 +1,3 @@
+# Copy to ~/.config/clickup-cli/config  (chmod 600)
+CLICKUP_TOKEN="pk_your_token_here"
+CLICKUP_LIST_ID="sample_id"

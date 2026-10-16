@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# clickup - tiny ClickUp CLI (API v2). Requires: curl, jq
+set -euo pipefail
+
+API="https://api.clickup.com/api/v2"
+CONFIG="${CLICKUP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/clickup-cli/config}"
+
+# Environment variables win over the config file
+_t="${CLICKUP_TOKEN:-}"; _l="${CLICKUP_LIST_ID:-}"
+# shellcheck disable=SC1090
+[[ -f "$CONFIG" ]] && source "$CONFIG"
+[[ -n "$_t" ]] && CLICKUP_TOKEN=$_t
+[[ -n "$_l" ]] && CLICKUP_LIST_ID=$_l
+
+die() { echo "error: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null || die "'$1' is required but not installed"; }
+need curl; need jq
+
+usage() {
+cat <<USAGE
+Usage: clickup <command> [options]
+
+Commands:
+  create [opts] "Task name"   Create a task
+  get <task_id>               Show a task
+  status <task_id> <status>   Change a task's status
+  comment <task_id> "text"    Add a comment
+  assign <task_id> <users>    Add assignees (comma-separated IDs, emails or usernames)
+  unassign <task_id> <users>  Remove assignees
+  workspaces [--short]        Tree of workspaces > spaces > folders > lists (IDs, no tasks)
+  members <team_id>           List workspace members (user IDs for -a)
+  spaces <team_id>            List spaces
+  folders <space_id>          List folders
+  lists <folder_id>           List lists in a folder
+  lists --space <space_id>    List folderless lists in a space
+  tasks [opts] [list_id]      List tasks (opts: -s status[,status]  -c include closed)
+  statuses [list_id]          Show valid status names for a list
+  use <list_id>               Set the default list
+
+create options:
+  -l <list_id>      List ID (default: \$CLICKUP_LIST_ID)
+  -d <text>         Description
+  -p <1-4>          Priority: 1 urgent, 2 high, 3 normal, 4 low
+  -s <status>       Status name (must exist in the list)
+  -D <date>         Due date, anything 'date -d' understands (e.g. "tomorrow", "2026-11-01")
+  -a <users>        Assignees: user IDs, emails or usernames, comma-separated
+  -t <tag,tag>      Tags
+  -h                Help
+
+Config: set CLICKUP_TOKEN (and optionally CLICKUP_LIST_ID) in the environment
+or in $CONFIG
+USAGE
+}
+
+case "${1:-}" in -h|--help|help|"") usage; exit 0 ;; esac
+[[ -n "${CLICKUP_TOKEN:-}" ]] || { usage; echo; die "CLICKUP_TOKEN is not set"; }
+
+# api METHOD PATH [JSON_BODY]
+api() {
+  local method="$1" path="$2" body="${3:-}" out code
+  local args=(-sS -X "$method" -H "Authorization: $CLICKUP_TOKEN" -H "Content-Type: application/json" -w $'\n%{http_code}')
+  [[ -n "$body" ]] && args+=(-d "$body")
+  out=$(curl "${args[@]}" "$API$path") || die "request failed"
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  if [[ "$code" != 2* ]]; then
+    echo "$out" | jq -r '.err // .' >&2
+    die "HTTP $code"
+  fi
+  printf '%s' "$out"
+}
+
+to_ms() { echo $(( $(date -d "$1" +%s) * 1000 )); }   # GNU date; macOS: brew install coreutils (gdate)
+csv_to_json() { jq -Rc 'split(",") | map(select(length>0))' <<<"$1"; }
+
+cmd_create() {
+  local list="${CLICKUP_LIST_ID:-}" desc="" prio="" status="" due="" assignees="" tags=""
+  local OPTIND=1 opt
+  while getopts "l:d:p:s:D:a:t:h" opt; do
+    case $opt in
+      l) list=$OPTARG ;; d) desc=$OPTARG ;; p) prio=$OPTARG ;; s) status=$OPTARG ;;
+      D) due=$OPTARG ;; a) assignees=$OPTARG ;; t) tags=$OPTARG ;; h) usage; exit 0 ;;
+      *) exit 1 ;;
+    esac
+  done
+  shift $((OPTIND-1))
+  local name="${*:-}"
+  [[ -n "$name" ]] || die "task name required"
+  [[ -n "$list" ]] || die "list ID required (-l, CLICKUP_LIST_ID, or 'clickup use <list_id>')"
+
+  [[ -n "$assignees" ]] && assignees=$(resolve_users "$assignees")
+  local due_ms=""; [[ -n "$due" ]] && due_ms=$(to_ms "$due")
+  local assignees_json='[]' tags_json='[]'
+  [[ -n "$assignees" ]] && assignees_json=$(csv_to_json "$assignees" | jq -c 'map(tonumber)')
+  [[ -n "$tags" ]] && tags_json=$(csv_to_json "$tags")
+
+  local body
+  body=$(jq -n \
+    --arg name "$name" --arg desc "$desc" --arg prio "$prio" --arg status "$status" \
+    --arg due "$due_ms" --argjson assignees "$assignees_json" --argjson tags "$tags_json" '
+    {name:$name, assignees:$assignees, tags:$tags}
+    + (if $desc   != "" then {markdown_description:$desc} else {} end)
+    + (if $prio   != "" then {priority:($prio|tonumber)} else {} end)
+    + (if $status != "" then {status:$status} else {} end)
+    + (if $due    != "" then {due_date:($due|tonumber), due_date_time:true} else {} end)')
+
+  api POST "/list/$list/task" "$body" | jq -r '"Created \(.id): \(.name)\n\(.url)"'
+}
+
+cmd_use() {
+  mkdir -p "$(dirname "$CONFIG")"; touch "$CONFIG"
+  if grep -q '^CLICKUP_LIST_ID=' "$CONFIG"; then
+    sed -i "s|^CLICKUP_LIST_ID=.*|CLICKUP_LIST_ID=\"$1\"|" "$CONFIG"
+  else
+    echo "CLICKUP_LIST_ID=\"$1\"" >> "$CONFIG"
+  fi
+  echo "Default list set to $1"
+}
+
+# resolve_users "183,jane@x.com,jdoe" -> "183,4521,77"  (accepts IDs, emails, usernames)
+resolve_users() {
+  local q id out=() team; team=$(api GET "/team") || exit 1
+  local IFS=,
+  for q in $1; do
+    if [[ "$q" =~ ^[0-9]+$ ]]; then out+=("$q"); continue; fi
+    id=$(jq -r --arg q "$q" '[.teams[].members[].user
+          | select(((.email // "")|ascii_downcase)==($q|ascii_downcase)
+                or ((.username // "")|ascii_downcase)==($q|ascii_downcase)) | .id] | first // empty' <<<"$team")
+    [[ -n "$id" ]] || die "no user matches '$q' (try: clickup members <team_id>)"
+    out+=("$id")
+  done
+  echo "${out[*]}"
+}
+
+cmd_assign() {   # assign|unassign <task_id> <user,user>
+  local mode="$1" task="$2" ids arr key="add"
+  [[ "$mode" == "unassign" ]] && key="rem"
+  ids=$(resolve_users "$3") || exit 1
+  arr=$(jq -Rc 'split(",") | map(tonumber)' <<<"$ids")
+  api PUT "/task/$task" "$(jq -n --argjson a "$arr" --arg k "$key" '{assignees:{($k):$a}}')" \
+    | jq -r '"\(.id) assignees: \([.assignees[].username] | join(", "))"'
+}
+
+cmd_get()       { api GET "/task/$1" | jq '{id,name,status:.status.status,url,assignees:[.assignees[].username],due_date}'; }
+cmd_status()    { api PUT "/task/$1" "$(jq -n --arg s "$2" '{status:$s}')" | jq -r '"\(.id) -> \(.status.status)"'; }
+cmd_comment()   { api POST "/task/$1/comment" "$(jq -n --arg t "$2" '{comment_text:$t}')" >/dev/null && echo "Comment added"; }
+cmd_workspaces() {
+  # Default: full tree (workspace > space > folder > list) with IDs, no tasks.
+  # Use --short for just the workspace list.
+  if [[ "${1:-}" == "--short" ]]; then
+    api GET "/team" | jq -r '.teams[] | "\(.id)\t\(.name)"'; return
+  fi
+  local tid tname sid sname
+  while IFS=$'\t' read -r tid tname; do
+    echo "Workspace: $tname [$tid]"
+    while IFS=$'\t' read -r sid sname; do
+      echo "  Space: $sname [$sid]"
+      api GET "/space/$sid/list" | jq -r '.lists[] | "    List: \(.name) [\(.id)]"'
+      api GET "/space/$sid/folder" | jq -r '.folders[] | "    Folder: \(.name) [\(.id)]", (.lists[]? | "      List: \(.name) [\(.id)]")'
+    done < <(api GET "/team/$tid/space" | jq -r '.spaces[] | "\(.id)\t\(.name)"')
+  done < <(api GET "/team" | jq -r '.teams[] | "\(.id)\t\(.name)"')
+}
+cmd_members()   { api GET "/team" | jq -r --arg id "$1" '.teams[] | select(.id==$id) | .members[].user | "\(.id)\t\(.username)\t\(.email)"'; }
+cmd_spaces()    { api GET "/team/$1/space" | jq -r '.spaces[] | "\(.id)\t\(.name)"'; }
+cmd_folders()   { api GET "/space/$1/folder" | jq -r '.folders[] | "\(.id)\t\(.name)"'; }
+cmd_lists() {
+  if [[ "${1:-}" == "--space" ]]; then api GET "/space/${2:?space id}/list"
+  else api GET "/folder/${1:?folder id}/list"; fi | jq -r '.lists[] | "\(.id)\t\(.name)"'
+}
+cmd_tasks() {   # tasks [-s status[,status]] [-c] [list_id]
+  local list="${CLICKUP_LIST_ID:-}" statuses="" closed="" OPTIND=1 opt st q=""
+  while getopts "s:c" opt; do
+    case $opt in s) statuses=$OPTARG ;; c) closed=1 ;; *) exit 1 ;; esac
+  done
+  shift $((OPTIND-1))
+  [[ -n "${1:-}" ]] && list=$1
+  [[ -n "$list" ]] || die "list ID required (pass one or run 'clickup use <list_id>')"
+  if [[ -n "$statuses" ]]; then
+    local IFS=,
+    for st in $statuses; do q+="&statuses%5B%5D=$(jq -rn --arg s "$st" '$s|@uri')"; done
+  fi
+  [[ -n "$closed" ]] && q+="&include_closed=true"
+  api GET "/list/$list/task?${q#&}" | jq -r '.tasks[] | "\(.id)\t[\(.status.status)]\t\(.name)"'
+}
+
+cmd_statuses() {   # statuses [list_id]
+  local list="${1:-${CLICKUP_LIST_ID:-}}"; [[ -n "$list" ]] || die "list ID required"
+  api GET "/list/$list" | jq -r '.statuses[] | "\(.orderindex)\t\(.status)\t(\(.type))"'
+}
+
+case "${1:-}" in
+  create)     shift; cmd_create "$@" ;;
+  get)        shift; cmd_get "${1:?task id}" ;;
+  status)     shift; cmd_status "${1:?task id}" "${2:?status}" ;;
+  comment)    shift; cmd_comment "${1:?task id}" "${2:?text}" ;;
+  workspaces) shift; cmd_workspaces "$@" ;;
+  members)    shift; cmd_members "${1:?team id}" ;;
+  spaces)     shift; cmd_spaces "${1:?team id}" ;;
+  folders)    shift; cmd_folders "${1:?space id}" ;;
+  lists)      shift; cmd_lists "$@" ;;
+  tasks)      shift; cmd_tasks "$@" ;;
+  statuses)   shift; cmd_statuses "${1:-}" ;;
+  use)        shift; cmd_use "${1:?list id}" ;;
+  assign|unassign) m="$1"; shift; cmd_assign "$m" "${1:?task id}" "${2:?user(s)}" ;;
+  *) usage; exit 1 ;;
+esac
