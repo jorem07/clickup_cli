@@ -2,7 +2,7 @@
 # clickup - tiny ClickUp CLI (API v2). Requires: curl, jq
 set -euo pipefail
 
-API="https://api.clickup.com/api/v2"
+API="${CLICKUP_API:-https://api.clickup.com/api/v2}"
 CONFIG="${CLICKUP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/clickup-cli/config}"
 
 # Environment variables win over the config file
@@ -35,6 +35,9 @@ Commands:
   lists --space <space_id>    List folderless lists in a space
   tasks [opts] [list_id]      List tasks (opts: -s status[,status]  -c include closed)
   statuses [list_id]          Show valid status names for a list
+  dashboard [list_id]         Summary: tasks by status, by assignee, overdue
+  dashboards <team_id>        Probe: dump ClickUp Dashboards if the API exposes them
+  raw [METHOD] </path> [json] Call any endpoint and print the JSON
   use <list_id>               Set the default list
 
 create options:
@@ -187,6 +190,34 @@ cmd_statuses() {   # statuses [list_id]
   api GET "/list/$list" | jq -r '.statuses[] | "\(.orderindex)\t\(.status)\t(\(.type))"'
 }
 
+cmd_dashboard() {   # dashboard [list_id] - quick summary of a list
+  local list="${1:-${CLICKUP_LIST_ID:-}}"; [[ -n "$list" ]] || die "list ID required (pass one or run 'clickup use <list_id>')"
+  api GET "/list/$list/task?include_closed=true" | jq -r '
+    .tasks as $t
+    | "Total tasks: \($t | length)",
+      "",
+      "By status:",
+      ($t | group_by(.status.status) | map("  \(.[0].status.status)\t\(length)")[]),
+      "",
+      "By assignee:",
+      ($t | map(.assignees[].username) | group_by(.) | map("  \(.[0])\t\(length)")[]),
+      "  (unassigned)\t\($t | map(select(.assignees | length == 0)) | length)",
+      "",
+      "Overdue (not closed): \($t | map(select(.due_date != null and (.due_date | tonumber) < (now * 1000) and .status.type != "closed")) | length)"'
+}
+
+cmd_raw() {   # raw [METHOD] </path> [json_body] - call any endpoint, print JSON
+  local method="GET" path body=""
+  if [[ "${1:-}" == /* ]]; then path=$1; body="${2:-}"; else method="${1:?method or /path}"; path="${2:?path}"; body="${3:-}"; fi
+  api "$method" "$path" "$body" | jq .
+}
+
+cmd_dashboards() {   # dashboards <team_id> - probe: dump dashboards if the API exposes them
+  local team="${1:?team id (see: clickup workspaces --short)}"
+  echo "# GET $API/team/$team/dashboard" >&2
+  api GET "/team/$team/dashboard" | jq .
+}
+
 case "${1:-}" in
   create)     shift; cmd_create "$@" ;;
   get)        shift; cmd_get "${1:?task id}" ;;
@@ -199,6 +230,9 @@ case "${1:-}" in
   lists)      shift; cmd_lists "$@" ;;
   tasks)      shift; cmd_tasks "$@" ;;
   statuses)   shift; cmd_statuses "${1:-}" ;;
+  dashboard)  shift; cmd_dashboard "${1:-}" ;;
+  dashboards) shift; cmd_dashboards "$@" ;;
+  raw)        shift; cmd_raw "$@" ;;
   use)        shift; cmd_use "${1:?list id}" ;;
   assign|unassign) m="$1"; shift; cmd_assign "$m" "${1:?task id}" "${2:?user(s)}" ;;
   *) usage; exit 1 ;;
